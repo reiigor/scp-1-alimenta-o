@@ -1,0 +1,293 @@
+// --- BIBLIOTECAS USADAS NESTE TRABALHO ---
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// --- CONFIGURAÇÃO DO DISPLAY I2C ---
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// --- CONFIGURAÇÕES E PINOS ---
+#define PINO_BOMBA_ACIDO  7
+#define PINO_BOMBA_BASE   8
+#define PINO_SENSOR_TEMP  10
+#define PINO_SENSOR_PH    A0
+
+// --- PINOS DOS BOTÕES ---
+#define PINO_BOTAO_MODO     2
+#define PINO_BOTAO_AUMENTA  3
+#define PINO_BOTAO_DIMINUI  4
+
+// --- PARÂMETROS DE CONTROLE ---
+float phAlvo = 3.0;
+const float TOLERANCIA_PH = 0.3;
+const float PASSO_AJUSTE_PH = 0.1;
+
+// --- PARÂMETROS DE CALIBRAÇÃO DE PH ---
+// IMPORTANTE: Insira aqui os valores da sua ÚLTIMA calibração feita com o sistema estável
+const float SLOPE_PH = -5.77;
+const float INTERCEPT_PH = 21.71;
+const int   NUM_AMOSTRAS_PH = 40;
+
+// --- INTERVALOS DE TEMPO (em milissegundos) ---
+const unsigned long INTERVALO_ATUALIZAR_DISPLAY = 2000;
+const unsigned long INTERVALO_LER_TEMP = 60000;
+const unsigned long DEBOUNCE_DELAY = 50;
+
+// --- LÓGICA DE CONTROLE: TEMPOS DO CICLO DE DOSAGEM ---
+const unsigned long TEMPO_DOSAGEM = 10000; // 10 segundos com a bomba ligada
+const unsigned long TEMPO_ESPERA_LEITURA = 20000; // 20 segundos de espera antes de ler o pH
+const unsigned long INTERVALO_VERIFICACAO_INICIAL = 60000; // 1 minuto (só no modo monitorando)
+
+// --- LÓGICA DE CONTROLE: MÁQUINA DE ESTADOS ---
+enum EstadoControle { MONITORANDO, DOSANDO_ACIDO, DOSANDO_BASE, ESPERANDO_PARA_LER, FAZENDO_LEITURA_CONTROLE };
+EstadoControle estadoAtual = MONITORANDO;
+
+// Variáveis para o controle de tempo
+unsigned long previousMillisLerTemp = 0;
+unsigned long previousMillisDisplay = 0;
+unsigned long timestampInicioCiclo = 0; // Guarda o tempo de início de uma etapa do ciclo
+
+// Variáveis globais
+float phAtualGlobal = 0.0;
+float tempAtualGlobal = -127.0;
+bool modoCalibracao = false;
+int estadoBotaoModo, ultimoEstadoBotaoModo = HIGH;
+unsigned long ultimoTempoDebounceModo = 0;
+int estadoBotaoAumenta, ultimoEstadoBotaoAumenta = HIGH;
+unsigned long ultimoTempoDebounceAumenta = 0;
+int estadoBotaoDiminui, ultimoEstadoBotaoDiminui = HIGH;
+unsigned long ultimoTempoDebounceDiminui = 0;
+
+// Inicialização dos sensores
+OneWire oneWire(PINO_SENSOR_TEMP);
+DallasTemperature sensors(&oneWire);
+
+void setup() {
+  Serial.begin(9600);
+  Serial.println("Iniciando sistema de controle de pH com dosagem pulsada.");
+
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Iniciando...");
+
+  pinMode(PINO_BOMBA_ACIDO, OUTPUT);
+  pinMode(PINO_BOMBA_BASE, OUTPUT);
+  pinMode(PINO_BOTAO_MODO, INPUT_PULLUP);
+  pinMode(PINO_BOTAO_AUMENTA, INPUT_PULLUP);
+  pinMode(PINO_BOTAO_DIMINUI, INPUT_PULLUP);
+
+  digitalWrite(PINO_BOMBA_ACIDO, LOW);
+  digitalWrite(PINO_BOMBA_BASE, LOW);
+
+  sensors.begin();
+  delay(2000);
+  lcd.clear();
+  timestampInicioCiclo = millis(); // Inicia o timer principal
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  gerenciarBotoes();
+
+  // A leitura de pH para o display é feita continuamente, pois não afeta o controle
+  phAtualGlobal = lerPH();
+
+  // Atualiza a temperatura e o display em seus próprios timers
+  if (currentMillis - previousMillisLerTemp >= INTERVALO_LER_TEMP) {
+    previousMillisLerTemp = currentMillis;
+    sensors.requestTemperatures();
+    tempAtualGlobal = sensors.getTempCByIndex(0);
+  }
+  if (currentMillis - previousMillisDisplay >= INTERVALO_ATUALIZAR_DISPLAY) {
+    previousMillisDisplay = currentMillis;
+    atualizarDisplay();
+  }
+
+  // --- LÓGICA DE CONTROLE: EXECUTA A MÁQUINA DE ESTADOS ---
+  // Só executa se não estiver no modo de ajuste de alvo
+  if (!modoCalibracao) {
+    gerenciarCicloDeControle(currentMillis);
+  }
+}
+
+void gerenciarCicloDeControle(unsigned long currentMillis) {
+  switch (estadoAtual) {
+    case MONITORANDO:
+      // No estado de monitoramento, verifica o pH a cada 1 minuto
+      if (currentMillis - timestampInicioCiclo >= INTERVALO_VERIFICACAO_INICIAL) {
+        Serial.println("---------------------------------");
+        Serial.println("[MONITORANDO] Verificando necessidade de correção...");
+        // A leitura é feita aqui, com as bombas desligadas, então é segura
+        float phParaControle = lerPH();
+        Serial.print("Leitura atual: "); Serial.println(phParaControle, 2);
+
+        if (phParaControle > (phAlvo + TOLERANCIA_PH)) {
+          Serial.println("Status: pH ALTO. Iniciando ciclo de dosagem de ÁCIDO.");
+          estadoAtual = DOSANDO_ACIDO;
+          timestampInicioCiclo = currentMillis; // Reinicia o cronômetro para o novo estado
+        } else if (phParaControle < (phAlvo - TOLERANCIA_PH)) {
+          Serial.println("Status: pH BAIXO. Iniciando ciclo de dosagem de BASE.");
+          estadoAtual = DOSANDO_BASE;
+          timestampInicioCiclo = currentMillis; // Reinicia o cronômetro
+        } else {
+          Serial.println("Status: pH em EQUILÍBRIO. Nenhuma ação necessária.");
+          timestampInicioCiclo = currentMillis; // Apenas reinicia o timer de monitoramento
+        }
+      }
+      break;
+
+    case DOSANDO_ACIDO:
+      digitalWrite(PINO_BOMBA_ACIDO, HIGH); // Liga a bomba de ácido
+      // Verifica se os 10 segundos de dosagem já passaram
+      if (currentMillis - timestampInicioCiclo >= TEMPO_DOSAGEM) {
+        digitalWrite(PINO_BOMBA_ACIDO, LOW); // Desliga a bomba
+        Serial.println("[DOSANDO] Fim dos 10s. Bomba desligada. Iniciando tempo de espera.");
+        estadoAtual = ESPERANDO_PARA_LER;
+        timestampInicioCiclo = currentMillis; // Reinicia o cronômetro para a espera
+      }
+      break;
+
+    case DOSANDO_BASE:
+      digitalWrite(PINO_BOMBA_BASE, HIGH); // Liga a bomba de base
+      // Verifica se os 10 segundos de dosagem já passaram
+      if (currentMillis - timestampInicioCiclo >= TEMPO_DOSAGEM) {
+        digitalWrite(PINO_BOMBA_BASE, LOW); // Desliga a bomba
+        Serial.println("[DOSANDO] Fim dos 10s. Bomba desligada. Iniciando tempo de espera.");
+        estadoAtual = ESPERANDO_PARA_LER;
+        timestampInicioCiclo = currentMillis; // Reinicia o cronômetro
+      }
+      break;
+
+    case ESPERANDO_PARA_LER:
+      // Não faz nada por 20 segundos, apenas espera
+      if (currentMillis - timestampInicioCiclo >= TEMPO_ESPERA_LEITURA) {
+        Serial.println("[ESPERANDO] Fim dos 20s. Realizando nova leitura de controle.");
+        estadoAtual = FAZENDO_LEITURA_CONTROLE;
+        // Não precisa reiniciar o timestamp, pois a leitura é imediata
+      }
+      break;
+
+    case FAZENDO_LEITURA_CONTROLE:
+      // Este estado é executado apenas uma vez para ler e decidir o próximo passo
+      float phAposCiclo = lerPH();
+      Serial.print("Leitura pós-ciclo: "); Serial.println(phAposCiclo, 2);
+
+      if (phAposCiclo > (phAlvo + TOLERANCIA_PH)) {
+        Serial.println("Resultado: pH ainda ALTO. Repetindo ciclo de dosagem de ÁCIDO.");
+        estadoAtual = DOSANDO_ACIDO;
+        timestampInicioCiclo = currentMillis; // Inicia um novo ciclo de 10s
+      } else if (phAposCiclo < (phAlvo - TOLERANCIA_PH)) {
+        Serial.println("Resultado: pH ainda BAIXO. Repetindo ciclo de dosagem de BASE.");
+        estadoAtual = DOSANDO_BASE;
+        timestampInicioCiclo = currentMillis; // Inicia um novo ciclo de 10s
+      } else {
+        Serial.println("Resultado: pH em EQUILÍBRIO. Retornando ao modo de monitoramento.");
+        estadoAtual = MONITORANDO;
+        timestampInicioCiclo = currentMillis; // Inicia o timer de 1 minuto do monitoramento
+      }
+      Serial.println("---------------------------------");
+      break;
+  }
+}
+
+float lerPH() {
+  long totalAnalogico = 0;
+  for (int i = 0; i < NUM_AMOSTRAS_PH; i++) {
+    totalAnalogico += analogRead(PINO_SENSOR_PH);
+    delay(2);
+  }
+  float mediaAnalogica = (float)totalAnalogico / NUM_AMOSTRAS_PH;
+  float voltagem = mediaAnalogica * (5.0 / 1023.0);
+  return (SLOPE_PH * voltagem) + INTERCEPT_PH;
+}
+
+void atualizarDisplay() {
+  lcd.setCursor(0, 0);
+  lcd.print("pH: ");
+  lcd.print(phAtualGlobal, 2);
+  lcd.print(" ");
+
+  lcd.setCursor(10, 0);
+  lcd.print("T:");
+  if (tempAtualGlobal != -127.0) {
+    lcd.print(tempAtualGlobal, 1);
+    lcd.print((char)223);
+    lcd.print("C");
+  } else {
+    lcd.print("--.-");
+  }
+
+  lcd.setCursor(0, 1);
+  if (modoCalibracao) {
+    lcd.print("Alvo: ");
+    lcd.print(phAlvo, 1);
+    lcd.print("      ");
+  } else {
+    // Mostra o estado atual do ciclo de controle
+    switch(estadoAtual) {
+      case MONITORANDO: lcd.print("Monitorando...  "); break;
+      case DOSANDO_ACIDO: lcd.print("Dosando Acido..."); break;
+      case DOSANDO_BASE: lcd.print("Dosando Base...."); break;
+      case ESPERANDO_PARA_LER: lcd.print("Aguardando...   "); break;
+      case FAZENDO_LEITURA_CONTROLE: lcd.print("Lendo pH...     "); break;
+    }
+  }
+}
+
+void gerenciarBotoes() {
+  int leituraModo = digitalRead(PINO_BOTAO_MODO);
+  if (leituraModo != ultimoEstadoBotaoModo) {
+    ultimoTempoDebounceModo = millis();
+  }
+  if ((millis() - ultimoTempoDebounceModo) > DEBOUNCE_DELAY) {
+    if (leituraModo != estadoBotaoModo) {
+      estadoBotaoModo = leituraModo;
+      if (estadoBotaoModo == LOW) {
+        modoCalibracao = !modoCalibracao;
+        if (modoCalibracao) {
+          Serial.println("\n>> MODO AJUSTE DE ALVO ATIVADO <<");
+          digitalWrite(PINO_BOMBA_ACIDO, LOW);
+          digitalWrite(PINO_BOMBA_BASE, LOW);
+          estadoAtual = MONITORANDO; // Reseta o estado do ciclo
+        } else {
+          Serial.println("\n>> MODO MONITORAMENTO ATIVADO <<");
+          timestampInicioCiclo = millis(); // Reinicia timer do ciclo ao sair do modo ajuste
+        }
+      }
+    }
+  }
+  ultimoEstadoBotaoModo = leituraModo;
+
+  if (modoCalibracao) {
+    // Lógica de debounce para os botões AUMENTA e DIMINUI (sem alterações)
+    int leituraAumenta = digitalRead(PINO_BOTAO_AUMENTA);
+    if (leituraAumenta != ultimoEstadoBotaoAumenta) ultimoTempoDebounceAumenta = millis();
+    if ((millis() - ultimoTempoDebounceAumenta) > DEBOUNCE_DELAY) {
+      if (leituraAumenta != estadoBotaoAumenta) {
+        estadoBotaoAumenta = leituraAumenta;
+        if (estadoBotaoAumenta == LOW) {
+          phAlvo += PASSO_AJUSTE_PH;
+          Serial.print("Novo pH Alvo: "); Serial.println(phAlvo, 2);
+        }
+      }
+    }
+    ultimoEstadoBotaoAumenta = leituraAumenta;
+
+    int leituraDiminui = digitalRead(PINO_BOTAO_DIMINUI);
+    if (leituraDiminui != ultimoEstadoBotaoDiminui) ultimoTempoDebounceDiminui = millis();
+    if ((millis() - ultimoTempoDebounceDiminui) > DEBOUNCE_DELAY) {
+      if (leituraDiminui != estadoBotaoDiminui) {
+        estadoBotaoDiminui = leituraDiminui;
+        if (estadoBotaoDiminui == LOW) {
+          phAlvo -= PASSO_AJUSTE_PH;
+          Serial.print("Novo pH Alvo: "); Serial.println(phAlvo, 2);
+        }
+      }
+    }
+    ultimoEstadoBotaoDiminui = leituraDiminui;
+  }
+}
