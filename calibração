@@ -1,0 +1,15 @@
+void setup() {
+  Serial.begin(9600);
+  
+}
+
+void loop() {
+  int leitura = analogRead(A0);
+  float tensao = (leitura * 5.0 / 1024.0);
+  Serial.print("Tensão de saída:");
+  Serial.print(tensao, 2);
+  Serial.println("V");
+  delay(500);
+  // put your main code here, to run repeatedly:
+
+}
